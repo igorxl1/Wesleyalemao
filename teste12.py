@@ -1,19 +1,19 @@
-# teste12.py
-# Multi-liga via URL do Sofascore (API oficial) + fallback ScraperFC.
-# Sem argumentos: modo interativo -> lista ligas, você escolhe, e ele consulta a temporada mais recente.
-# Flags úteis:
+# Multi-liga via URL do Sofascore (API oficial) + fallback ScraperFC. (Atualmente está rodando pelo fallback
+# Sem argumentos: modo interativo -> você escolhe a LIGA e o ANO. (Isso evita as alterações direta no codigo) mas se tu quiser mexer para alterar algo, é valido
+# Flags:
 #   --list-leagues  : lista ligas aceitas pelo ScraperFC e sai
-#   --list-aliases  : mostra mapeamentos (apelidos -> nome oficial) e sai
+#   --list-aliases  : mostra apelidos -> nome oficial e sai
 #   --url           : URL do Sofascore (tournament/season) p/ tentar API oficial
-#   --league        : nome da liga p/ fallback (opcional com --url)
-#   --year          : ano p/ fallback (opcional com --url)
+#   --league        : nome da liga p/ fallback (opcional)
+#   --year          : ano/temporada p/ fallback (ex.: 2024 ou "24/25") (opcional)
+# Todas esse comentarios acima é caso tu queira fazer a consulta para algumas dessas funções, aí para não precisar rodar o codigo todo pode rodar ele por essas flags
 
 import re
 import time
 import argparse
 import requests
 import pandas as pd
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 from requests.adapters import HTTPAdapter, Retry
 
 # ======== CONFIG ========
@@ -34,9 +34,9 @@ HEADERS_FALLBACK = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# ======== ALIASES (apelidos -> nomes aceitos pelo ScraperFC) ========
+# ======== ALIASES ========
 SCRAPERFC_ALIASES = {
-    # internacionais/clubes
+    # internacionais/clubes -- meio validado
     "champions league": "Champions League",
     "uefa champions league": "Champions League",
     "ucl": "Champions League",
@@ -44,7 +44,7 @@ SCRAPERFC_ALIASES = {
     "uefa europa league": "Europa League",
     "europa conference league": "Europa Conference League",
 
-    # ligas nacionais principais
+    # ligas nacionais principais -- validado
     "epl": "EPL",
     "premier league": "EPL",
     "english premier league": "EPL",
@@ -57,7 +57,7 @@ SCRAPERFC_ALIASES = {
     "super lig": "Turkish Super Lig",
     "superliga turca": "Turkish Super Lig",
 
-    # américas
+    # américas -- não validei
     "mls": "MLS",
     "usl championship": "USL Championship",
     "usl1": "USL1",
@@ -70,10 +70,10 @@ SCRAPERFC_ALIASES = {
     "copa de la liga": "Argentina Copa de la Liga Profesional",
     "liga 1 peru": "Liga 1 Peru",
 
-    # arábia
+    # arábia -- não validei
     "saudi pro league": "Saudi Pro League",
 
-    # seleções
+    # seleções -- não validei
     "world cup": "World Cup",
     "copa do mundo": "World Cup",
     "euros": "Euros",
@@ -81,11 +81,11 @@ SCRAPERFC_ALIASES = {
     "gold cup": "Gold Cup",
     "copa ouro": "Gold Cup",
 
-    # libertadores e variantes
+    # libertadores e variantes -- validado
     "libertadores": "Copa Libertadores",
     "copa libertadores": "Copa Libertadores",
 
-    # brasil - apelidos (Série A/B e Copa do Brasil)
+    # brasil - apelidos (serão válidos apenas se o pacote suportar a liga) -- validado
     "brasileirao": "Brasileirão Série A",
     "campeonato brasileiro": "Brasileirão Série A",
     "serie a brasil": "Brasileirão Série A",
@@ -100,35 +100,31 @@ SCRAPERFC_ALIASES = {
     "copa do brasil": "Copa do Brasil",
 }
 
-# ======== LISTA FALLBACK DE LIGAS (se ScraperFC não expuser listagem) ========
-SCRAPERFC_VALID_LEAGUES_FALLBACK: List[str] = sorted(set(list(SCRAPERFC_ALIASES.values()) + [
-    # adicionar outros nomes comuns suportados por versões recentes
-    "Argentina Liga Profesional",
-    "Argentina Copa de la Liga Profesional",
-    "Liga 1 Peru",
-    "Saudi Pro League",
-    "USL Championship",
-    "USL1",
-    "USL2",
-    "World Cup",
-    "Euros",
-    "Gold Cup",
-    "Europa Conference League",
+# ======== LISTA FALLBACK ENXUTA ========
+SCRAPERFC_VALID_LEAGUES_FALLBACK: List[str] = [
     "Champions League",
     "Europa League",
+    "Europa Conference League",
     "EPL",
     "La Liga",
     "Bundesliga",
     "Serie A",
     "Ligue 1",
     "Turkish Super Lig",
+    "Argentina Liga Profesional",
+    "Argentina Copa de la Liga Profesional",
+    "Liga 1 Peru",
     "Copa Libertadores",
     "MLS",
-    # Brasil (se sua versão do ScraperFC suportar)
-    "Brasileirão Série A",
-    "Brasileirão Série B",
-    "Copa do Brasil",
-]))
+    "USL Championship",
+    "USL1",
+    "USL2",
+    "Saudi Pro League",
+    "World Cup",
+    "Euros",
+    "Gold Cup",
+    "Women's World Cup",
+]
 
 def normalize_league_name(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -138,12 +134,8 @@ def normalize_league_name(s: Optional[str]) -> Optional[str]:
 
 # ======== UTILS ========
 def extract_ids_from_url(url: str) -> Tuple[int, int]:
-    """
-    Extrai tournamentId e seasonId da URL do Sofascore.
-    Ex.: .../conmebol-libertadores/384#id:70083 -> (384, 70083)
-    """
-    m_t = re.search(r"/(\d+)(?:[#?/]|$)", url)        # último número do path
-    m_s = re.search(r"#id:(\d+)", url)                # seasonId no hash
+    m_t = re.search(r"/(\d+)(?:[#?/]|$)", url)
+    m_s = re.search(r"#id:(\d+)", url)
     if not m_t or not m_s:
         raise ValueError("Não foi possível extrair tournamentId e seasonId da URL.")
     return int(m_t.group(1)), int(m_s.group(1))
@@ -160,7 +152,6 @@ def build_session() -> requests.Session:
     return s
 
 def get_json(session: requests.Session, url: str) -> dict:
-    # tenta com headers "fortes" e depois fallback
     last_exc = None
     for headers in (HEADERS_PRIMARY, HEADERS_FALLBACK):
         r = session.get(url, headers=headers, timeout=TIMEOUT)
@@ -174,6 +165,32 @@ def get_json(session: requests.Session, url: str) -> dict:
         raise last_exc
     raise RuntimeError("Falha inesperada em get_json")
 
+# ---- Ordenação correta de temporadas (YYYY ou YY/YY) ----
+def season_order_key(season_key: str) -> int:
+    """
+    Converte a chave de temporada para um inteiro 'ano-final' para ordenar corretamente. (Aqui tem que deixar int por é data direta na request)
+    Exemplos:
+      '2024'  -> 2024
+      '24/25' -> 2025
+      '99/00' -> 2000
+    """
+    season_key = str(season_key).strip()
+    # YYYY
+    m4 = re.fullmatch(r"\d{4}", season_key)
+    if m4:
+        return int(season_key)
+    # YY/YY
+    m = re.fullmatch(r"(\d{2})/(\d{2})", season_key)
+    if m:
+        end = int(m.group(2))
+        # regra simples: <=30 => 2000+, senão 1900+
+        return (2000 + end) if end <= 30 else (1900 + end)
+    # fallback: tenta int direto
+    try:
+        return int(season_key)
+    except:
+        return -1  # vai para o começo se não reconhecido
+
 # ======== API DIRETA (INFO/STANDINGS/TEAMS/EVENTS) ========
 def api_get_tournament_info(session: requests.Session, tournament_id: int) -> dict:
     url = f"{BASE}/unique-tournament/{tournament_id}"
@@ -185,9 +202,8 @@ def api_get_tournament_info(session: requests.Session, tournament_id: int) -> di
 def api_get_standings(session: requests.Session, tournament_id: int, season_id: int) -> pd.DataFrame:
     url = f"{BASE}/unique-tournament/{tournament_id}/season/{season_id}/standings"
     data = get_json(session, url)
-    blocks = data.get("standings", []) or []
     rows = []
-    for block in blocks:
+    for block in data.get("standings", []) or []:
         grupo = block.get("name") or block.get("type")
         for row in block.get("rows", []) or []:
             team = row.get("team", {}) or {}
@@ -210,9 +226,8 @@ def api_get_standings(session: requests.Session, tournament_id: int, season_id: 
 def api_get_teams(session: requests.Session, tournament_id: int, season_id: int) -> pd.DataFrame:
     url = f"{BASE}/unique-tournament/{tournament_id}/season/{season_id}/teams"
     data = get_json(session, url)
-    teams = data.get("teams", []) or []
     rows = []
-    for t in teams:
+    for t in data.get("teams", []) or []:
         country = t.get("country") or {}
         rows.append({
             "TeamId": t.get("id"),
@@ -231,9 +246,8 @@ def api_get_events(session: requests.Session, tournament_id: int, season_id: int
         data = get_json(session, url)
     except requests.HTTPError:
         return pd.DataFrame()
-    events = data.get("events", []) or []
     rows = []
-    for e in events:
+    for e in data.get("events", []) or []:
         home = e.get("homeTeam", {}) or {}
         away = e.get("awayTeam", {}) or {}
         status = e.get("status", {}) or {}
@@ -258,10 +272,6 @@ def api_get_events(session: requests.Session, tournament_id: int, season_id: int
 
 # ======== SCRAPERFC HELPERS ========
 def list_scraperfc_leagues() -> List[str]:
-    """
-    Tenta obter a lista de ligas diretamente do pacote ScraperFC.
-    Se não houver método público pra isso, usa um fallback extensivo.
-    """
     try:
         from ScraperFC import Sofascore
         sfc = Sofascore()
@@ -275,26 +285,29 @@ def list_scraperfc_leagues() -> List[str]:
 
 def fallback_scraperfc_matches_and_stats(league_name: str,
                                          season_id: Optional[int],
-                                         year_override: Optional[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                                         year_override: Optional[Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    league_name: nome aceito pelo ScraperFC (já normalizado)
-    season_id : seasonId da URL do Sofascore (para tentar mapear pro 'ano')
-    year_override: se informado, força este ano
+    year_override pode ser '2024' OU '24/25' (string). Não altera para int caso tu vá mexer no codigo, se mudar ele vai quebrar.
     """
     from ScraperFC import Sofascore  # import tardio
     sfc = Sofascore()
 
-    seasons = sfc.get_valid_seasons(league_name)  # ex.: {"2025": 70083, "2024": 6xxxx, ...}
-    inv = {v: k for k, v in seasons.items()}      # seasonId->ano (string)
+    seasons = sfc.get_valid_seasons(league_name)  # ex.: {"24/25": 70083, "2024": 6xxxx, ...}
+    inv = {v: k for k, v in seasons.items()}      # seasonId->seasonKey (string)
 
-    if year_override:
-        year_str = str(year_override)
+    if year_override is not None:
+        year_key = str(year_override)
     else:
-        year_str = inv.get(season_id) or (seasons and max(seasons.keys()))
-    if not year_str:
-        raise RuntimeError(f"Não foi possível deduzir o ano para a liga '{league_name}' no fallback.")
+        # tenta via season_id da URL; se não, usa a "mais recente" por ordem de ano final (CASO A ESCOLHA DO ANO SEJA INVALIDA)
+        year_key = inv.get(season_id)
+        if not year_key:
+            if seasons:
+                year_key = max(seasons.keys(), key=season_order_key)
+            else:
+                raise RuntimeError(f"Sem seasons disponíveis para '{league_name}'.")
 
-    matches = sfc.get_match_dicts(year=year_str, league=league_name)
+    # Jogos
+    matches = sfc.get_match_dicts(year=year_key, league=league_name)
 
     def get_in(d, *path):
         cur = d
@@ -322,10 +335,11 @@ def fallback_scraperfc_matches_and_stats(league_name: str,
         df_matches["DataUTC"] = pd.to_datetime(df_matches["DataUTC_ts"], unit="s", utc=True)
         df_matches.sort_values(by="DataUTC", inplace=True)
 
-    df_stats = sfc.scrape_player_league_stats(year=year_str, league=league_name, accumulation="total")
+    # Estatísticas de jogadores (acumulado)
+    df_stats = sfc.scrape_player_league_stats(year=year_key, league=league_name, accumulation="total")
     return df_matches, df_stats
 
-# ======== INTERAÇÃO NO CONSOLE ========
+# ======== INTERAÇÃO NO CONSOLE, AGORA TU VAI ESCOLHER O ANO NO CONSOLE SEM PRECISASR ALTERAR O CODIGO (liga + ano) ========
 def _prompt_choose(options: List[str], title: str) -> int:
     print(f"\n{title}")
     for i, opt in enumerate(options, start=1):
@@ -340,68 +354,77 @@ def _prompt_choose(options: List[str], title: str) -> int:
             return idx - 1
         print("Opção fora do intervalo. Tente novamente.")
 
-def run_interactive_latest_only() -> None:
+def run_interactive_pick_year() -> None:
     """
-    Lista ligas, você escolhe 1, e ele consulta automaticamente a temporada MAIS RECENTE dessa liga.
-    Gera: events_fallback.csv e player_stats_fallback.csv.
+    Lista ligas suportadas, você escolhe a liga, depois escolhe o ANO meu primo werley(ex.: 2024 ou 24/25).
     """
     try:
-        from ScraperFC import Sofascore  # valida instalação
+        from ScraperFC import Sofascore
+        from ScraperFC.scraperfc_exceptions import InvalidLeagueException
     except ModuleNotFoundError:
         print("❌ ScraperFC não está instalado. Instale com: python -m pip install ScraperFC")
         return
 
-    leagues = list_scraperfc_leagues()
-    if not leagues:
-        print("❌ Não foi possível obter a lista de ligas.")
-        return
+    while True:
+        leagues = list_scraperfc_leagues()
+        if not leagues:
+            print("❌ Não foi possível obter a lista de ligas.")
+            return
 
-    li = _prompt_choose(leagues, "== Ligas disponíveis (ScraperFC) ==")
-    league_name = leagues[li]
-    print(f"➡️  Liga selecionada: {league_name}")
+        li = _prompt_choose(leagues, "== Ligas disponíveis (ScraperFC) ==")
+        league_name = leagues[li]
+        print(f"➡️  Liga selecionada: {league_name}")
 
-    from ScraperFC import Sofascore
-    sfc = Sofascore()
-    seasons = sfc.get_valid_seasons(league_name)  # dict { "2025": seasonId, "2024": ... }
-    if not seasons:
-        print("❌ Não há temporadas disponíveis para essa liga no ScraperFC.")
-        return
+        sfc = Sofascore()
+        try:
+            seasons = sfc.get_valid_seasons(league_name)  # dict: seasonKey -> seasonId (importante)
+        except InvalidLeagueException:
+            print(f"⚠️  '{league_name}' não é suportada pela sua versão do ScraperFC. Escolha outra liga.\n")
+            continue
 
-    latest_year = max(seasons.keys())  # mais recente
-    print(f"📅 Usando a temporada mais recente: {latest_year}")
+        if not seasons:
+            print("⚠️  Não há temporadas disponíveis para essa liga. Escolha outra.\n")
+            continue
 
-    try:
-        df_matches, df_stats = fallback_scraperfc_matches_and_stats(
-            league_name=league_name,
-            season_id=None,
-            year_override=int(latest_year)
-        )
+        # ordenar por ano-final real (desc)
+        years_sorted = sorted(seasons.keys(), key=season_order_key, reverse=True)
+        yi = _prompt_choose(years_sorted, f"== Temporadas disponíveis para {league_name} ==")
+        year_key = years_sorted[yi]
+        print(f"📅 Temporada selecionada: {year_key}")
 
-        if not df_matches.empty:
-            df_matches.to_csv("events_fallback.csv", index=False, encoding="utf-8-sig")
-            print(f"✅ events_fallback.csv gerado (liga={league_name}, ano={latest_year}).")
-        else:
-            print("⚠️ Não foi possível coletar jogos no fallback.")
+        try:
+            df_matches, df_stats = fallback_scraperfc_matches_and_stats(
+                league_name=league_name,
+                season_id=None,
+                year_override=year_key  # NÃO converter para int
+            )
 
-        if isinstance(df_stats, pd.DataFrame) and not df_stats.empty:
-            df_stats.to_csv("player_stats_fallback.csv", index=False, encoding="utf-8-sig")
-            print("✅ player_stats_fallback.csv gerado (via ScraperFC).")
-        else:
-            print("⚠️ Não foi possível coletar estatísticas de jogadores no fallback.")
-    except Exception as e:
-        print(f"❗ Erro no modo interativo/fallback: {e}")
+            if not df_matches.empty:
+                df_matches.to_csv("events_fallback.csv", index=False, encoding="utf-8-sig")
+                print(f"✅ events_fallback.csv gerado (liga={league_name}, temporada={year_key}).")
+            else:
+                print("⚠️ Não foi possível coletar jogos no fallback.")
+
+            if isinstance(df_stats, pd.DataFrame) and not df_stats.empty:
+                df_stats.to_csv("player_stats_fallback.csv", index=False, encoding="utf-8-sig")
+                print("✅ player_stats_fallback.csv gerado (via ScraperFC).")
+            else:
+                print("⚠️ Não foi possível coletar estatísticas de jogadores no fallback.")
+        except Exception as e:
+            print(f"❗ Erro no modo interativo/fallback: {e}")
+        break
 
 # ======== MAIN ========
 def main():
     parser = argparse.ArgumentParser(description="Coleta dados de ligas da Sofascore (API oficial + fallback ScraperFC).")
     parser.add_argument("--url", help="URL do torneio/temporada no Sofascore (ex.: .../384#id:70083)")
     parser.add_argument("--league", default=None, help="Nome da liga para o fallback (ex.: 'Copa Libertadores', 'EPL', 'La Liga').")
-    parser.add_argument("--year", type=int, default=None, help="Ano para o fallback (ex.: 2025). Se omitido, tenta deduzir pelo seasonId.")
+    parser.add_argument("--year", default=None, help="Temporada para o fallback (ex.: 2024 ou 24/25).")
     parser.add_argument("--list-leagues", action="store_true", help="Lista ligas aceitas pelo ScraperFC e sai.")
     parser.add_argument("--list-aliases", action="store_true", help="Lista os aliases de ligas suportados para normalização e sai.")
     args = parser.parse_args()
 
-    # ----- Somente listagens -----
+    # Somente listagens
     if args.list_leagues:
         leagues = list_scraperfc_leagues()
         print("✅ Ligas aceitas pelo ScraperFC (ordem alfabética):")
@@ -415,10 +438,9 @@ def main():
             print(f"- {k}  ->  {SCRAPERFC_ALIASES[k]}")
         return
 
-    # ----- Execução normal -----
+    # Sem URL: modo interativo (liga + ano)
     if not args.url:
-        # Sem argumentos de URL: entra no modo interativo (escolhe liga e usa a temporada mais recente)
-        run_interactive_latest_only()
+        run_interactive_pick_year()
         return
 
     # Com URL: tenta API oficial, depois fallback
@@ -426,18 +448,14 @@ def main():
     tournament_id, season_id = extract_ids_from_url(liga_url)
     session = build_session()
 
-    # Descobre nome da liga via API (para usar no fallback se usuário não passar)
+    # Nome da liga para fallback
     fallback_league = normalize_league_name(args.league) if args.league else None
     if not fallback_league:
         info = api_get_tournament_info(session, tournament_id)
-        name = None
-        try:
-            name = (info.get("uniqueTournament") or {}).get("name")
-        except Exception:
-            name = None
+        name = (info.get("uniqueTournament") or {}).get("name") if isinstance(info, dict) else None
         fallback_league = normalize_league_name(name)
 
-    # --- Tenta API oficial ---
+    # Tenta API oficial (está dando 403 normalemnte, tenho que verificar depois o por que)
     try:
         df_stand = api_get_standings(session, tournament_id, season_id)
         df_teams = api_get_teams(session, tournament_id, season_id)
@@ -470,25 +488,25 @@ def main():
     except Exception as e:
         print(f"❗ Erro inesperado na rota API: {e}")
 
-    # --- Fallback via ScraperFC ---
+    # Fallback ScraperFC
     print("↩️  Caindo no fallback via ScraperFC (partidas + stats de jogadores)...")
     try:
         if not fallback_league:
             raise RuntimeError(
                 "Não consegui deduzir automaticamente o nome da liga para o fallback. "
                 "Use --league (ex.: --league 'Copa Libertadores', --league 'EPL'). "
-                "Ou rode sem --url para escolher a liga no console."
+                "Ou rode sem --url para escolher liga/ano no console."
             )
 
         df_matches, df_stats = fallback_scraperfc_matches_and_stats(
             league_name=fallback_league,
             season_id=season_id,
-            year_override=args.year
+            year_override=args.year  # agora essa caralha vai entender o formato correto
         )
 
         if not df_matches.empty:
             df_matches.to_csv("events_fallback.csv", index=False, encoding="utf-8-sig")
-            print(f"✅ events_fallback.csv gerado (via ScraperFC, liga={fallback_league}).")
+            print(f"✅ events_fallback.csv gerado (via ScraperFC, liga={fallback_league}, temporada={args.year or 'automática'}).")
         else:
             print("⚠️ Não foi possível coletar jogos no fallback.")
 
